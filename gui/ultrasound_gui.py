@@ -1,10 +1,11 @@
 import json
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 
 CONFIG_FILE_NAME = "gui_config.json"
@@ -62,11 +63,49 @@ def save_config(config_path: Path, cfg: AppConfig) -> None:
         pass
 
 
+class RunnerThread(QtCore.QThread):
+    line_received = QtCore.Signal(str)
+    finished_with_code = QtCore.Signal(int)
+
+    def __init__(self, args: list[str], work_dir: str, parent: QtCore.QObject | None = None) -> None:
+        super().__init__(parent)
+        self._args = args
+        self._work_dir = work_dir
+
+    def run(self) -> None:  # noqa: D401
+        """在线程中运行子进程并逐行读取输出。"""
+        try:
+            proc = subprocess.Popen(
+                self._args,
+                cwd=self._work_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception as e:  # noqa: BLE001
+            self.line_received.emit(f"[ERROR] 无法启动进程: {e}")
+            self.finished_with_code.emit(-1)
+            return
+
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            self.line_received.emit(line.rstrip("\n"))
+
+        proc.wait()
+        self.finished_with_code.emit(proc.returncode)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Ultrasound Beamforming GUI")
         self.resize(1100, 750)
+
+        self._runner_thread: "RunnerThread | None" = None
+        self._image_paths: list[Path] = []
+        self._current_pixmap: QtGui.QPixmap | None = None
 
         self._config_path = Path(__file__).resolve().parent / CONFIG_FILE_NAME
         self._config = load_config(self._config_path)
@@ -190,7 +229,155 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.addWidget(splitter, 1)
 
         # 连接信号
-        # run_button 的实际逻辑将在后续子进程实现步骤中补充
+        self.run_button.clicked.connect(self._on_run_clicked)
+
+        self.image_list.currentIndexChanged.connect(self._on_image_selected)
+
+    # ----------------- 运行 easy_app 相关 -----------------
+    def _on_run_clicked(self) -> None:
+        if self._runner_thread is not None and self._runner_thread.isRunning():
+            # 当前简单处理为禁用“停止”功能，避免复杂状态：后续可扩展为真正终止进程
+            QtWidgets.QMessageBox.information(
+                self,
+                "正在运行",
+                "程序正在运行，请等待当前运行结束。",
+            )
+            return
+
+        cfg = self._gather_config_from_ui()
+
+        # 基本校验
+        if not cfg.easy_app_path or not os.path.isfile(cfg.easy_app_path):
+            QtWidgets.QMessageBox.warning(self, "路径错误", "请正确选择 easy_app.exe 路径。")
+            return
+        if not cfg.mock_path or not os.path.isfile(cfg.mock_path):
+            QtWidgets.QMessageBox.warning(self, "路径错误", "请正确选择 .mock 输入文件。")
+            return
+        if not cfg.raw_path or not os.path.isfile(cfg.raw_path):
+            QtWidgets.QMessageBox.warning(self, "路径错误", "请正确选择 .raw 输入文件。")
+            return
+        if not cfg.output_dir:
+            QtWidgets.QMessageBox.warning(self, "路径错误", "请正确选择输出目录。")
+            return
+
+        # 创建输出目录
+        try:
+            Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+        except Exception as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(
+                self,
+                "输出目录错误",
+                f"无法创建输出目录：{cfg.output_dir}\n{e}",
+            )
+            return
+
+        # 清空日志，更新状态
+        self.log_edit.clear()
+        self.status_label.setText("正在运行...")
+        self.run_button.setEnabled(False)
+
+        # 启动后台线程
+        args = [
+            cfg.easy_app_path,
+            cfg.mock_path,
+            cfg.raw_path,
+            cfg.output_dir,
+        ]
+
+        self._runner_thread = RunnerThread(args=args, work_dir=str(Path(cfg.easy_app_path).parent))
+        self._runner_thread.line_received.connect(self._append_log_line)
+        self._runner_thread.finished_with_code.connect(self._on_run_finished)
+        self._runner_thread.start()
+
+    @QtCore.Slot(str)
+    def _append_log_line(self, line: str) -> None:
+        self.log_edit.appendPlainText(line.rstrip("\n"))
+        # 自动滚动到底部
+        cursor = self.log_edit.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.End)
+        self.log_edit.setTextCursor(cursor)
+
+    @QtCore.Slot(int)
+    def _on_run_finished(self, exit_code: int) -> None:
+        self.run_button.setEnabled(True)
+        if exit_code == 0:
+            self.status_label.setText("完成")
+        else:
+            self.status_label.setText(f"失败（退出码 {exit_code}）")
+
+        # 运行完成后刷新结果图像列表
+        self._refresh_image_list()
+
+    # ----------------- 结果图像相关 -----------------
+    def _refresh_image_list(self) -> None:
+        """扫描输出目录中的 PNG 文件并填充下拉列表。"""
+        cfg = self._gather_config_from_ui()
+        output_dir = Path(cfg.output_dir) if cfg.output_dir else None
+        self.image_list.blockSignals(True)
+        self.image_list.clear()
+        self._image_paths = []
+        self._current_pixmap = None
+        self.image_view.setText("结果图像将在这里显示")
+
+        if output_dir is None or not output_dir.exists():
+            self.image_list.blockSignals(False)
+            return
+
+        png_files = sorted(output_dir.glob("*.png"))
+        if not png_files:
+            self.image_list.blockSignals(False)
+            QtWidgets.QMessageBox.information(
+                self,
+                "未找到图像",
+                f"在目录中未找到 PNG 图像：{output_dir}",
+            )
+            return
+
+        for p in png_files:
+            self.image_list.addItem(p.name)
+            self._image_paths.append(p)
+
+        self.image_list.blockSignals(False)
+        # 默认选择第一个
+        self.image_list.setCurrentIndex(0)
+        self._load_current_image()
+
+    def _on_image_selected(self, index: int) -> None:
+        if index < 0:
+            return
+        self._load_current_image()
+
+    def _load_current_image(self) -> None:
+        idx = self.image_list.currentIndex()
+        if idx < 0 or idx >= len(self._image_paths):
+            return
+        path = self._image_paths[idx]
+        pixmap = QtGui.QPixmap(str(path))
+        if pixmap.isNull():
+            self.image_view.setText(f"无法加载图像：{path.name}")
+            self._current_pixmap = None
+            return
+
+        self._current_pixmap = pixmap
+        self._update_image_view()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: D401
+        """在窗口大小变化时自适应缩放图像。"""
+        super().resizeEvent(event)
+        self._update_image_view()
+
+    def _update_image_view(self) -> None:
+        if self._current_pixmap is None:
+            return
+        label_size = self.image_view.size()
+        if label_size.width() <= 0 or label_size.height() <= 0:
+            return
+        scaled = self._current_pixmap.scaled(
+            label_size,
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
+        self.image_view.setPixmap(scaled)
 
     # ----------------- 配置相关操作 -----------------
     def _gather_config_from_ui(self) -> AppConfig:

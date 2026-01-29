@@ -158,3 +158,27 @@ Visual `*.png` results are stored in `res` directory. You could also specify the
 ```
     $ easy_app.exe data/linearProbe_IPCAI_128-2.mock data/linearProbe_IPCAI_128-2_0.raw <directory to store results>
 ```
+
+### (4) Optional: Run with Python GUI
+
+For users who prefer a graphical interface, this repository provides a simple Python-based GUI wrapper to run `easy_app.exe`, display kernel timing logs, and browse generated PNG images:
+
+1. Ensure you have Python 3.9+ installed.
+2. Install GUI dependencies from the repository root:
+
+```bash
+cd gui
+pip install -r requirements.txt
+```
+
+3. Run the GUI:
+
+```bash
+python gui/ultrasound_gui.py
+```
+
+In the GUI, you can:
+
+- Configure paths for `easy_app.exe`, input `.mock`/`.raw` files, and the output directory.
+- Start a run and watch the console output (including per-kernel timing) in the log panel.
+- Browse the generated `*.png` images in the selected output directory.
